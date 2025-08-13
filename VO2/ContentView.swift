@@ -7,16 +7,16 @@ struct ContentView: View {
     var body: some View {
         TabView {
             NavigationStack {
-                PlanListView()
+                HomeView()
                     .navigationTitle("Plan")
             }
             .tabItem { Label("Plan", systemImage: "list.bullet") }
             
             NavigationStack {
-                GenerateView()
-                    .navigationTitle("Generate")
+                PlanListView()
+                    .navigationTitle("Modify Plan")
             }
-            .tabItem { Label("Generate", systemImage: "hammer") }
+            .tabItem { Label("Edit", systemImage: "slider.horizontal.3") }
             
             NavigationStack {
                 SettingsView()

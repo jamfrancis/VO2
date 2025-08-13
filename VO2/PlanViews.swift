@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import UIKit
 
 @MainActor
 final class PlanStore: ObservableObject {
@@ -194,25 +195,35 @@ struct PlanHeaderView: View {
     var totalWorkouts: Int { plan.weeks.reduce(0) { $0 + $1.workouts.count } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(vo2 > 0 ? String(format: "%.1f", vo2) : "—")
-                .font(.system(size: 48, weight: .bold))
-            Text("VO₂ Max")
-                .font(.headline)
-                .foregroundColor(.secondary)
-            if !fitness.isEmpty {
-                Text(fitness)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(vo2 > 0 ? String(format: "%.1f", vo2) : "—")
+                    .font(.system(size: 56, weight: .bold))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("VO₂ Max").font(.headline).foregroundStyle(.secondary)
+                    if !fitness.isEmpty { Text(fitness).font(.subheadline).foregroundStyle(.secondary) }
+                }
+                Spacer()
             }
-            Divider()
+            if vo2 > 0 {
+                Gauge(value: min(max((vo2 - 20) / 50, 0), 1)) { } currentValueLabel: { Text(String(format: "%.0f", vo2)) } minimumValueLabel: { Text("20") } maximumValueLabel: { Text("70+") }
+                    .tint(.blue)
+            }
             HStack(spacing: 16) {
                 Label("\(plan.weeks.count) weeks", systemImage: "calendar")
                 Label("\(totalWorkouts) workouts", systemImage: "figure.run")
             }
             .font(.subheadline)
-            .foregroundColor(.secondary)
+            .foregroundStyle(.secondary)
         }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.ultraThinMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
     }
 }
 
@@ -311,5 +322,172 @@ struct BlockRow: View {
                 }
             }
         }
+    }
+}
+
+struct HomeView: View {
+    @EnvironmentObject var store: PlanStore
+    @EnvironmentObject var health: HealthKitManager
+    @StateObject private var saver = FileSaver()
+    @State private var genError: String? = nil
+    
+    enum ScheduleState { case idle, working, success(String), failure(String) }
+    @State private var scheduleState: ScheduleState = .idle
+    
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                if let plan = store.plan {
+                    PlanHeaderView(vo2: health.vo2Max, fitness: health.fitnessLevel, plan: plan)
+                        .padding(.horizontal)
+                        .padding(.top)
+                    
+                    PlanCalendarView(plan: plan)
+                        .padding(.horizontal)
+                    
+                    if let first = workoutForToday(in: plan) {
+                        VStack(spacing: 12) {
+                            Button {
+                                generate(for: first)
+                            } label: {
+                                Label("Generate today's .workout", systemImage: "doc.badge.plus")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            
+                            if #available(iOS 17, *) {
+                                Button {
+                                    Task { await onSchedule(workout: first) }
+                                } label: {
+                                    Label(scheduleButtonTitle, systemImage: scheduleButtonIcon)
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(isBusy)
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
+                } else {
+                    Text("Import a plan JSON from Settings")
+                        .foregroundStyle(.secondary)
+                        .padding()
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if case .success(let msg) = scheduleState {
+                ToastView(title: "Scheduled", message: msg, systemImage: "checkmark.circle.fill")
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .padding()
+            } else if case .failure(let msg) = scheduleState {
+                ToastView(title: "Failed", message: msg, systemImage: "exclamationmark.triangle.fill")
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .padding()
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                HStack {
+                    Button("Shift +1d") { store.shiftSchedule(days: 1) }
+                    Button("Shift -1d") { store.shiftSchedule(days: -1) }
+                }
+            }
+        }
+        .alert("Generation Error", isPresented: Binding(get: { genError != nil }, set: { if !$0 { genError = nil } })) {
+            Button("OK", role: .cancel) { genError = nil }
+        } message: { Text(genError ?? "") }
+    }
+    
+    private var isBusy: Bool {
+        if case .working = scheduleState { return true }
+        return false
+    }
+    private var scheduleButtonTitle: String {
+        switch scheduleState {
+        case .idle: return "Schedule"
+        case .working: return "Scheduling…"
+        case .success: return "Scheduled"
+        case .failure: return "Try Again"
+        }
+    }
+    private var scheduleButtonIcon: String {
+        switch scheduleState {
+        case .idle: return "clock.badge.checkmark"
+        case .working: return "clock.arrow.circlepath"
+        case .success: return "checkmark.circle"
+        case .failure: return "exclamationmark.triangle"
+        }
+    }
+    
+    private func workoutForToday(in plan: Plan) -> Workout? {
+        let start = plan.startDate ?? store.startDate ?? Date()
+        let delta = Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: start), to: Calendar.current.startOfDay(for: Date())).day ?? 0
+        let todayIndex = max(1, delta + 1)
+        let flat = plan.weeks.flatMap { $0.workouts }
+        let key: (Workout) -> Int = { (($0.weekIndex - 1) * 7 + $0.day) }
+        if let exact = flat.first(where: { key($0) == todayIndex }) { return exact }
+        if let next = flat.sorted { key($0) < key($1) }.first(where: { key($0) >= todayIndex }) { return next }
+        return flat.sorted { key($0) < key($1) }.last
+    }
+    
+    private func generate(for workout: Workout) {
+        let dayIndex = max(1, (workout.weekIndex - 1) * 7 + workout.day)
+        let targetDate = store.dateForPlanDay(dayIndex) ?? Date()
+        let title = makeTitle(dayIndex: dayIndex, date: targetDate)
+        do {
+            let (data, _) = try WorkoutFileGenerator().generate(workout: workout, titleOverride: title)
+            if let root = UIApplication.shared.connectedScenes.compactMap({ ($0 as? UIWindowScene)?.keyWindow?.rootViewController }).first {
+                saver.saveAndShare(data: data, suggestedName: title, from: root)
+            }
+        } catch {
+            genError = error.localizedDescription
+        }
+    }
+    
+    @available(iOS 17, *)
+    private func onSchedule(workout: Workout) async {
+        if isBusy { return }
+        scheduleState = .working
+        let dayIndex = max(1, (workout.weekIndex - 1) * 7 + workout.day)
+        let targetDate = store.dateForPlanDay(dayIndex) ?? Date()
+        let title = makeTitle(dayIndex: dayIndex, date: targetDate)
+        do {
+            let (data, _) = try WorkoutFileGenerator().generate(workout: workout, titleOverride: title)
+            try await WKBridge.schedule(data: data, at: targetDate)
+            scheduleState = .success(title + " on Apple Watch")
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { withAnimation { scheduleState = .idle } }
+        } catch {
+            scheduleState = .failure(error.localizedDescription)
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { withAnimation { scheduleState = .idle } }
+        }
+    }
+    
+    private func makeTitle(dayIndex: Int, date: Date) -> String {
+        let month = Calendar.current.component(.month, from: date)
+        let day = Calendar.current.component(.day, from: date)
+        let m: String = { switch month { case 1: return "Jan"; case 2: return "Feb"; case 3: return "Mar"; case 4: return "Apr"; case 5: return "May"; case 6: return "Jun"; case 7: return "Jul"; case 8: return "Aug"; case 9: return "Sept"; case 10: return "Oct"; case 11: return "Nov"; default: return "Dec" } }()
+        return "Day \(dayIndex) | \(m) \(day)"
+    }
+}
+
+struct ToastView: View {
+    let title: String
+    let message: String
+    let systemImage: String
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: systemImage).imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(message).font(.subheadline).foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+        .padding()
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .shadow(radius: 10, y: 6)
     }
 }
